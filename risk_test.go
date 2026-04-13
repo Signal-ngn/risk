@@ -722,6 +722,138 @@ func TestEvaluate_SLZero_TrailingStop_FallbackActiveTrail(t *testing.T) {
 	}
 }
 
+// ── granularityDuration ───────────────────────────────────────────────────────
+
+func TestGranularityDuration_FourHours(t *testing.T) {
+	d := granularityDuration("FOUR_HOURS")
+	if d != 4*time.Hour {
+		t.Errorf("FOUR_HOURS: got %v, want 4h", d)
+	}
+}
+
+func TestGranularityDuration_SixHours(t *testing.T) {
+	d := granularityDuration("SIX_HOURS")
+	if d != 6*time.Hour {
+		t.Errorf("SIX_HOURS: got %v, want 6h", d)
+	}
+}
+
+func TestGranularityDuration_OneDay(t *testing.T) {
+	d := granularityDuration("ONE_DAY")
+	if d != 24*time.Hour {
+		t.Errorf("ONE_DAY: got %v, want 24h", d)
+	}
+}
+
+// ── isCoarseGranularity ───────────────────────────────────────────────────────
+
+func TestIsCoarseGranularity(t *testing.T) {
+	cases := []struct {
+		gran  string
+		want  bool
+	}{
+		{"FOUR_HOURS", true},
+		{"SIX_HOURS", true},
+		{"ONE_DAY", true},
+		{"ONE_HOUR", false},
+		{"FIVE_MINUTES", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		got := isCoarseGranularity(tc.gran)
+		if got != tc.want {
+			t.Errorf("isCoarseGranularity(%q): got %v, want %v", tc.gran, got, tc.want)
+		}
+	}
+}
+
+// ── close-based SL for coarse granularity ────────────────────────────────────
+
+func TestEvaluate_SignalSL_FourHours_UseClose_NoFire(t *testing.T) {
+	// 4H candle: low dips below SL but close is above → should NOT fire
+	pos := &Position{
+		EntryPrice:  1.000,
+		Side:        "long",
+		StopLoss:    0.960,
+		HardStop:    0.850,
+		Strategy:    "ml_transformer",
+		Granularity: "FOUR_HOURS",
+		Leverage:    2,
+		OpenedAt:    time.Now().Add(-1 * time.Minute),
+	}
+	// low=0.955 would fire with 1H logic, but close=0.975 > SL=0.960
+	_, exit := Evaluate(pos, 1.000, 0.955, 0.975, time.Now())
+	if exit {
+		t.Fatal("4H signal SL: should NOT fire when close > SL even if low <= SL")
+	}
+}
+
+func TestEvaluate_SignalSL_FourHours_UseClose_Fires(t *testing.T) {
+	// 4H candle: close below SL → SHOULD fire
+	pos := &Position{
+		EntryPrice:  1.000,
+		Side:        "long",
+		StopLoss:    0.960,
+		HardStop:    0.850,
+		Strategy:    "ml_transformer",
+		Granularity: "FOUR_HOURS",
+		Leverage:    2,
+		OpenedAt:    time.Now().Add(-1 * time.Minute),
+	}
+	// close=0.955 < SL=0.960 → fires
+	decision, exit := Evaluate(pos, 0.990, 0.950, 0.955, time.Now())
+	if !exit {
+		t.Fatal("4H signal SL: should fire when close < SL")
+	}
+	if decision.Layer != 1 {
+		t.Errorf("expected Layer 1 (signal SL), got %d", decision.Layer)
+	}
+}
+
+func TestEvaluate_SignalSL_FourHours_HardStopStillUsesLow(t *testing.T) {
+	// Hard stop still uses low even on 4H granularity
+	pos := &Position{
+		EntryPrice:  1.000,
+		Side:        "long",
+		StopLoss:    0.960,
+		HardStop:    0.900,
+		Strategy:    "ml_transformer",
+		Granularity: "FOUR_HOURS",
+		Leverage:    2,
+		OpenedAt:    time.Now().Add(-1 * time.Minute),
+	}
+	// low=0.895 <= hard stop=0.900, close=0.975 (above signal SL)
+	decision, exit := Evaluate(pos, 0.990, 0.895, 0.975, time.Now())
+	if !exit {
+		t.Fatal("hard stop should still fire on low even for FOUR_HOURS")
+	}
+	if decision.Layer != 2 {
+		t.Errorf("expected Layer 2 (hard stop), got %d", decision.Layer)
+	}
+}
+
+// ── FOUR_HOURS time exit candle count ────────────────────────────────────────
+
+func TestEvaluate_TimeExit_FourHours_CandleCount(t *testing.T) {
+	// ml_transformer / FOUR_HOURS → 48h limit → 12 four-hour candles
+	pos := &Position{
+		EntryPrice:  1.000,
+		Side:        "long",
+		HardStop:    0.700,
+		Strategy:    "ml_transformer",
+		Granularity: "FOUR_HOURS",
+		Leverage:    2,
+		OpenedAt:    time.Now().Add(-(48*time.Hour + 5*time.Minute)),
+	}
+	decision, exit := Evaluate(pos, 1.010, 0.995, 1.000, time.Now())
+	if !exit {
+		t.Fatal("time exit should fire after 48h hold")
+	}
+	if !strings.Contains(decision.Detail, "12-candle") {
+		t.Errorf("FOUR_HOURS time exit should say '12-candle', got: %q", decision.Detail)
+	}
+}
+
 // ── helper: verify exit reason format ────────────────────────────────────────
 
 func TestExitReasonFormat(t *testing.T) {

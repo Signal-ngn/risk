@@ -105,9 +105,27 @@ func granularityDuration(granularity string) time.Duration {
 		return 5 * time.Minute
 	case "ONE_HOUR":
 		return time.Hour
+	case "FOUR_HOURS":
+		return 4 * time.Hour
+	case "SIX_HOURS":
+		return 6 * time.Hour
+	case "ONE_DAY":
+		return 24 * time.Hour
 	default:
 		return time.Hour
 	}
+}
+
+// isCoarseGranularity returns true for granularities where intrabar wicks are
+// large enough to wick-fire a signal stop-loss even when the candle closes above
+// the stop level. For these granularities the signal SL is checked against the
+// candle close rather than the candle low (hard stop still uses low).
+func isCoarseGranularity(granularity string) bool {
+	switch granularity {
+	case "FOUR_HOURS", "SIX_HOURS", "ONE_DAY":
+		return true
+	}
+	return false
 }
 
 // candleCountForDuration returns the candle count for a hold duration and granularity.
@@ -161,15 +179,29 @@ func Evaluate(pos *Position, high, low, close float64, now time.Time) (ExitDecis
 		}
 	}
 
-	// Layer 1: Signal SL — check intra-bar range
+	// Layer 1: Signal SL
+	// For coarse granularities (4H, 6H, 1D) check against the candle close to
+	// avoid wick-fired false stops — the intrabar range is wide enough that the
+	// wick can touch the stop level while the candle closes well above it.
+	// For fine granularities (5m, 1H) the intrabar range is smaller so we check
+	// the full intrabar low/high as before.
+	// Note: the hard stop (Layer 2 above) always uses low/high regardless of granularity.
 	if pos.StopLoss > 0 {
-		if pos.Side == "long" && low <= pos.StopLoss {
-			detail := fmt.Sprintf("price $%.4f hit stop $%.4f", low, pos.StopLoss)
+		slCheckPrice := low
+		if isCoarseGranularity(pos.Granularity) {
+			slCheckPrice = close
+		}
+		slCheckHigh := high
+		if isCoarseGranularity(pos.Granularity) {
+			slCheckHigh = close
+		}
+		if pos.Side == "long" && slCheckPrice <= pos.StopLoss {
+			detail := fmt.Sprintf("price $%.4f hit stop $%.4f", slCheckPrice, pos.StopLoss)
 			reason := exitReason(1, "signal SL", detail)
 			return ExitDecision{Layer: 1, Label: "signal SL", Detail: detail, ExitReason: reason}, true
 		}
-		if pos.Side == "short" && high >= pos.StopLoss {
-			detail := fmt.Sprintf("price $%.4f hit stop $%.4f", high, pos.StopLoss)
+		if pos.Side == "short" && slCheckHigh >= pos.StopLoss {
+			detail := fmt.Sprintf("price $%.4f hit stop $%.4f", slCheckHigh, pos.StopLoss)
 			reason := exitReason(1, "signal SL", detail)
 			return ExitDecision{Layer: 1, Label: "signal SL", Detail: detail, ExitReason: reason}, true
 		}

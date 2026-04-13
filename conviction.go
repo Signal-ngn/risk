@@ -21,6 +21,42 @@ type PositionContext struct {
 	EntryPrice float64       // price at position entry
 	EntryATR   float64       // ATR at time of entry (from MarkEntry)
 	SignalAge  time.Duration // time since last 4H TFT signal
+
+	// TFT/regime context — populated by callers (backtester, trader) at the
+	// boundary from their own forecast types. Zero values disable all new
+	// signals and preserve archived behaviour (see ForecastSnapshot.Valid).
+	Forecast          ForecastSnapshot
+	Regime            RegimeSnapshot
+	ForecastAge       time.Duration
+	EntryUncertainty  float64
+	EntryMedianReturn float64
+
+	// GraceWindow is the duration after entry during which the TFT reconfirm
+	// bonus may fire. Zero disables both the bonus and the threshold ramp.
+	GraceWindow time.Duration
+}
+
+// ForecastSnapshot is a leaf, strategy-agnostic mirror of a TFT forecast.
+// Callers populate it from their own SignalForecast at the call boundary so
+// the risk library never imports any strategy package.
+type ForecastSnapshot struct {
+	Valid           bool
+	MedianReturnH48 float64
+	UncertaintyH48  float64
+	QuantileLowH48  float64
+	QuantileHighH48 float64
+	ConfirmH24      float64
+	Timestamp       time.Time
+}
+
+// RegimeSnapshot is a leaf mirror of the HTS regime classifier output.
+// Empty State indicates "no regime context supplied" and disables the
+// regime-adverse signal.
+type RegimeSnapshot struct {
+	State          string // "", "normal", "bull_trend", "bear_trend", "turbulent"
+	AllowLong      bool
+	AllowShort     bool
+	VolatilityMult float64
 }
 
 // ErosionSignal describes a single active erosion signal contributing to score decay.
@@ -401,14 +437,25 @@ const convictionWarmup = 26
 
 // Erosion signal weights (as penalties).
 const (
-	weightMACDHistDecline   = 0.15
-	weightRSICross          = 0.10
-	weightStochCross        = 0.10
-	weightSupertrendFlip    = 0.25
-	weightATRExpansion      = 0.15
-	weightBollingerReject   = 0.10
-	weightAdverseDrawdown   = 0.10
-	weightSignalStaleness   = 0.05
+	weightMACDHistDecline = 0.15
+	weightRSICross        = 0.10
+	weightStochCross      = 0.10
+	weightSupertrendFlip  = 0.25
+	weightATRExpansion    = 0.15
+	weightBollingerReject = 0.10
+	weightAdverseDrawdown = 0.10
+	weightSignalStaleness = 0.05
+
+	// TFT/regime-aware signals (see openspec change tft-aware-conviction-scorer).
+	weightTFTDirectionFlipH48     = 0.20
+	weightTFTConfirmDisagreeH24   = 0.10
+	weightTFTUncertaintyExpansion = 0.10
+	weightRegimeAdverse           = 0.15
+	weightTFTReconfirmBonus       = 0.10
+
+	// Uncertainty expansion fires when current uncertainty grows by this factor
+	// or more relative to the entry-time baseline.
+	uncertaintyExpansionFactor = 1.5
 )
 
 // ConvictionScorer evaluates conviction health for an open position using 15M candles.
@@ -425,8 +472,10 @@ type ConvictionScorer struct {
 	histBuf *ringBuf
 
 	// Tracking state
-	count    int
-	entryATR float64
+	count             int
+	entryATR          float64
+	entryUncertainty  float64
+	entryMedianReturn float64
 
 	// Latest indicator values
 	lastRSI            float64
@@ -522,6 +571,40 @@ func (cs *ConvictionScorer) MarkEntry() float64 {
 	return cs.entryATR
 }
 
+// MarkEntryForecast captures forecast-baseline values at position entry.
+// An invalid snapshot (Valid == false) clears the baseline so the
+// uncertainty-expansion signal is disabled.
+func (cs *ConvictionScorer) MarkEntryForecast(snapshot ForecastSnapshot) {
+	if !snapshot.Valid {
+		cs.entryUncertainty = 0
+		cs.entryMedianReturn = 0
+		return
+	}
+	cs.entryUncertainty = snapshot.UncertaintyH48
+	cs.entryMedianReturn = snapshot.MedianReturnH48
+}
+
+// EntryForecast returns the captured (entryUncertainty, entryMedianReturn)
+// baseline. Zero values mean no valid forecast was marked at entry.
+func (cs *ConvictionScorer) EntryForecast() (entryUncertainty, entryMedianReturn float64) {
+	return cs.entryUncertainty, cs.entryMedianReturn
+}
+
+// EffectiveThresholds returns the (exit, tighten) thresholds adjusted for the
+// entry-time grace ramp. During the window `pos.ForecastAge < pos.GraceWindow`
+// (and only when the forecast is valid and graceFactor is positive), both
+// thresholds are scaled by graceFactor. Outside the window — or when any of
+// the gating conditions fail — the raw thresholds are returned unchanged.
+func EffectiveThresholds(pos PositionContext, exitThreshold, tightenThreshold, graceFactor float64) (effectiveExit, effectiveTighten float64) {
+	if !pos.Forecast.Valid || pos.GraceWindow <= 0 || graceFactor <= 0 {
+		return exitThreshold, tightenThreshold
+	}
+	if pos.ForecastAge < 0 || pos.ForecastAge >= pos.GraceWindow {
+		return exitThreshold, tightenThreshold
+	}
+	return exitThreshold * graceFactor, tightenThreshold * graceFactor
+}
+
 // Score evaluates conviction health for the given position context.
 // Returns (score, activeSignals). Score is 0.0-1.0 where 1.0 = full conviction.
 func (cs *ConvictionScorer) Score(pos PositionContext) (float64, []ErosionSignal) {
@@ -571,7 +654,33 @@ func (cs *ConvictionScorer) Score(pos PositionContext) (float64, []ErosionSignal
 		signals = append(signals, sig)
 	}
 
-	// Compute score: 1.0 + sum(penalties), clamped to [0, 1]
+	// 9. TFT h48 direction flip
+	if sig, ok := cs.checkTFTDirectionFlipH48(pos); ok {
+		signals = append(signals, sig)
+	}
+
+	// 10. TFT h24/h48 confirmation disagreement
+	if sig, ok := cs.checkTFTConfirmDisagreeH24(pos); ok {
+		signals = append(signals, sig)
+	}
+
+	// 11. TFT h48 uncertainty expansion
+	if sig, ok := cs.checkTFTUncertaintyExpansion(pos); ok {
+		signals = append(signals, sig)
+	}
+
+	// 12. Adverse regime
+	if sig, ok := cs.checkRegimeAdverse(pos); ok {
+		signals = append(signals, sig)
+	}
+
+	// 13. TFT reinforcement bonus (positive contribution)
+	if sig, ok := cs.checkTFTReconfirmBonus(pos, pos.GraceWindow); ok {
+		signals = append(signals, sig)
+	}
+
+	// Compute score: 1.0 + sum(weights), clamped to [0, 1]. Reinforcement
+	// signals carry positive Weight, erosion signals negative.
 	score := 1.0
 	for _, s := range signals {
 		score += s.Weight
@@ -792,6 +901,126 @@ func (cs *ConvictionScorer) checkStaleness(signalAge time.Duration) (ErosionSign
 		Name:   "signal_staleness",
 		Weight: -penalty,
 		Value:  signalAge.Round(time.Minute).String(),
+	}, true
+}
+
+// --- TFT/regime-aware signal detectors ---
+
+// checkTFTDirectionFlipH48 fires when the h48 median-return forecast has flipped
+// to point opposite the position direction.
+func (cs *ConvictionScorer) checkTFTDirectionFlipH48(pos PositionContext) (ErosionSignal, bool) {
+	if !pos.Forecast.Valid || pos.Forecast.MedianReturnH48 == 0 {
+		return ErosionSignal{}, false
+	}
+	flipped := false
+	if pos.Side == "long" && pos.Forecast.MedianReturnH48 < 0 {
+		flipped = true
+	}
+	if pos.Side == "short" && pos.Forecast.MedianReturnH48 > 0 {
+		flipped = true
+	}
+	if !flipped {
+		return ErosionSignal{}, false
+	}
+	return ErosionSignal{
+		Name:   "tft_direction_flip_h48",
+		Weight: -weightTFTDirectionFlipH48,
+		Value:  formatFloat(pos.Forecast.MedianReturnH48),
+	}, true
+}
+
+// checkTFTConfirmDisagreeH24 fires when h24 and h48 medians point opposite
+// directions, indicating intra-horizon disagreement.
+func (cs *ConvictionScorer) checkTFTConfirmDisagreeH24(pos PositionContext) (ErosionSignal, bool) {
+	if !pos.Forecast.Valid {
+		return ErosionSignal{}, false
+	}
+	if pos.Forecast.MedianReturnH48 == 0 || pos.Forecast.ConfirmH24 == 0 {
+		return ErosionSignal{}, false
+	}
+	// Opposite signs ⇒ product < 0.
+	if pos.Forecast.MedianReturnH48*pos.Forecast.ConfirmH24 >= 0 {
+		return ErosionSignal{}, false
+	}
+	return ErosionSignal{
+		Name:   "tft_confirm_disagree_h24",
+		Weight: -weightTFTConfirmDisagreeH24,
+		Value:  "h24=" + formatFloat(pos.Forecast.ConfirmH24) + "/h48=" + formatFloat(pos.Forecast.MedianReturnH48),
+	}, true
+}
+
+// checkTFTUncertaintyExpansion fires when the current h48 quantile spread has
+// grown by uncertaintyExpansionFactor × the entry-time baseline.
+func (cs *ConvictionScorer) checkTFTUncertaintyExpansion(pos PositionContext) (ErosionSignal, bool) {
+	if !pos.Forecast.Valid {
+		return ErosionSignal{}, false
+	}
+	if pos.EntryUncertainty <= 0 || pos.Forecast.UncertaintyH48 <= 0 {
+		return ErosionSignal{}, false
+	}
+	ratio := pos.Forecast.UncertaintyH48 / pos.EntryUncertainty
+	if ratio < uncertaintyExpansionFactor {
+		return ErosionSignal{}, false
+	}
+	return ErosionSignal{
+		Name:   "tft_uncertainty_expansion",
+		Weight: -weightTFTUncertaintyExpansion,
+		Value:  formatFloat(ratio) + "x entry σ",
+	}, true
+}
+
+// checkRegimeAdverse fires when the regime classifier reports a state that
+// contradicts the position direction, or a turbulent regime.
+func (cs *ConvictionScorer) checkRegimeAdverse(pos PositionContext) (ErosionSignal, bool) {
+	if !pos.Forecast.Valid || pos.Regime.State == "" {
+		return ErosionSignal{}, false
+	}
+	adverse := false
+	switch {
+	case pos.Regime.State == "turbulent":
+		adverse = true
+	case pos.Side == "long" && !pos.Regime.AllowLong:
+		adverse = true
+	case pos.Side == "short" && !pos.Regime.AllowShort:
+		adverse = true
+	}
+	if !adverse {
+		return ErosionSignal{}, false
+	}
+	return ErosionSignal{
+		Name:   "regime_adverse",
+		Weight: -weightRegimeAdverse,
+		Value:  pos.Regime.State,
+	}, true
+}
+
+// checkTFTReconfirmBonus returns a positive-weight signal when a recent
+// forecast still agrees with the position direction. Caller passes the active
+// grace window; bonus is suppressed when graceWindow is non-positive.
+func (cs *ConvictionScorer) checkTFTReconfirmBonus(pos PositionContext, graceWindow time.Duration) (ErosionSignal, bool) {
+	if !pos.Forecast.Valid || graceWindow <= 0 {
+		return ErosionSignal{}, false
+	}
+	if pos.ForecastAge < 0 || pos.ForecastAge >= graceWindow {
+		return ErosionSignal{}, false
+	}
+	if pos.Forecast.MedianReturnH48 == 0 {
+		return ErosionSignal{}, false
+	}
+	agrees := false
+	if pos.Side == "long" && pos.Forecast.MedianReturnH48 > 0 {
+		agrees = true
+	}
+	if pos.Side == "short" && pos.Forecast.MedianReturnH48 < 0 {
+		agrees = true
+	}
+	if !agrees {
+		return ErosionSignal{}, false
+	}
+	return ErosionSignal{
+		Name:   "tft_reconfirm_bonus",
+		Weight: +weightTFTReconfirmBonus,
+		Value:  pos.ForecastAge.Round(time.Minute).String(),
 	}, true
 }
 
